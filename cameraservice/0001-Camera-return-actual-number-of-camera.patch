@@ -1,0 +1,174 @@
+From 5db9534e853b51609e93b0d013e5f2bc39f3a56d Mon Sep 17 00:00:00 2001
+Date: Wed, 27 Jan 2016 15:47:17 +0800
+Subject: [PATCH] Camera: return actual number of camera
+
+listen uevent
+
+
+---
+ services/camera/libcameraservice/Android.mk        |    6 ++
+ services/camera/libcameraservice/CameraService.cpp |   72 +++++++++++++++++++-
+ services/camera/libcameraservice/CameraService.h   |    5 ++
+ 3 files changed, 80 insertions(+), 3 deletions(-)
+
+diff --git a/services/camera/libcameraservice/Android.mk b/services/camera/libcameraservice/Android.mk
+index e184d97..3bf51b5 100644
+--- a/services/camera/libcameraservice/Android.mk
++++ b/services/camera/libcameraservice/Android.mk
+@@ -72,6 +72,12 @@ LOCAL_C_INCLUDES += \
+     system/media/private/camera/include \
+     external/jpeg
+ 
++# Patch Begin
++LOCAL_C_INCLUDES += \
++	$(call include-path-for, libhardware_legacy)/hardware_legacy
++LOCAL_SHARED_LIBRARIES += \
++	libhardware_legacy
++# Patch End
+ 
+ LOCAL_CFLAGS += -Wall -Wextra
+ 
+diff --git a/services/camera/libcameraservice/CameraService.cpp b/services/camera/libcameraservice/CameraService.cpp
+index b9b7926..3c36ba2 100644
+--- a/services/camera/libcameraservice/CameraService.cpp
++++ b/services/camera/libcameraservice/CameraService.cpp
+@@ -21,6 +21,7 @@
+ #include <string.h>
+ #include <sys/types.h>
+ #include <pthread.h>
++#include <sys/prctl.h>
+ 
+ #include <binder/AppOpsManager.h>
+ #include <binder/IPCThreadState.h>
+@@ -49,6 +50,9 @@
+ #include "api2/CameraDeviceClient.h"
+ #include "utils/CameraTraces.h"
+ #include "CameraDeviceFactory.h"
++// Patch Begin
++#include "hardware_legacy/uevent.h"
++// Patch End
+ 
+ namespace android {
+ 
+@@ -107,6 +111,61 @@ CameraService::CameraService()
+     this->camera_device_status_change = android::camera_device_status_change;
+ }
+ 
++// Patch Begin
++void *CameraService::waitForNextEvent(void *data) {
++    char buffer[1024];
++    uevent_init();
++
++    prctl(PR_SET_NAME, (unsigned long)"cameraEvent thread", 0, 0, 0);
++
++    //Check the cameras which has been plugged in at before
++    if (access("/dev/video0", F_OK) == 0) {
++        ALOGV("CameraService::Find that the camera /dev/video0 has been plugged in");
++        gCameraService->updateStatus(ICameraServiceListener::STATUS_PRESENT, gCameraService->mNumberOfCameras);
++        gCameraService->mNumberOfCameras++;
++    }
++    if (access("/dev/video1", F_OK) == 0) {
++        ALOGV("CameraService::Find that the camera /dev/video1 has been plugged in");
++        gCameraService->updateStatus(ICameraServiceListener::STATUS_PRESENT, gCameraService->mNumberOfCameras);
++        gCameraService->mNumberOfCameras++;
++    }
++
++
++    while (1) {
++        int length = uevent_next_event(buffer, sizeof(buffer) - 1);
++        if (length <= 0) {
++            return NULL;
++        }
++        buffer[length] = '\0';
++
++        LOG2("CameraService::Camera received uevent message: %s", buffer);
++        updateCameraDevice(buffer, length);
++    }
++    return NULL;
++}
++
++void CameraService::updateCameraDevice(const char *buffer, size_t length) {
++    // Consider all zero-delimited fields of the buffer.
++    const char *field = buffer;
++    const char *field_temp = buffer;
++    const char *end = buffer + length + 1;
++    do {
++        if (strstr(field, "DEVNAME=video0") || strstr(field, "DEVNAME=video1")) {
++            ALOGV("CameraService::Matched uevent message with pattern: %s", field);
++            if (strstr(field_temp, "add@")) {
++                gCameraService->updateStatus(ICameraServiceListener::STATUS_PRESENT, gCameraService->mNumberOfCameras);
++                gCameraService->mNumberOfCameras++;
++            } else if (strstr(field_temp, "remove@")) {
++                gCameraService->mNumberOfCameras--;
++                gCameraService->updateStatus(ICameraServiceListener::STATUS_NOT_PRESENT, gCameraService->mNumberOfCameras);
++            }
++            ALOGV("CameraService::Numberofcameras is %d", gCameraService->mNumberOfCameras);
++        }
++        field += strlen(field) + 1;
++    } while (field != end);
++}
++// Patch End
++
+ void CameraService::onFirstRef()
+ {
+     LOG1("CameraService::onFirstRef");
+@@ -120,7 +179,9 @@ void CameraService::onFirstRef()
+     }
+     else {
+         ALOGI("Loaded \"%s\" camera module", mModule->common.name);
+-        mNumberOfCameras = mModule->get_number_of_cameras();
++        // Patch Begin
++        mNumberOfCameras = 0;
++        // Patch End
+         if (mNumberOfCameras > MAX_CAMERAS) {
+             ALOGE("Number of cameras(%d) > MAX_CAMERAS(%d).",
+                     mNumberOfCameras, MAX_CAMERAS);
+@@ -136,6 +197,11 @@ void CameraService::onFirstRef()
+         }
+ 
+         VendorTagDescriptor::clearGlobalVendorTagDescriptor();
++        // Patch Begin
++        pthread_t uevent_thread;
++        pthread_create(&uevent_thread, NULL, waitForNextEvent, NULL);
++        pthread_detach(uevent_thread);
++        // Patch End
+ 
+         if (mModule->common.module_api_version >= CAMERA_MODULE_API_VERSION_2_2) {
+             setUpVendorTags();
+@@ -221,7 +287,7 @@ void CameraService::onDeviceStatusChanged(int cameraId,
+ }
+ 
+ int32_t CameraService::getNumberOfCameras() {
+-    return 1;
++    return mNumberOfCameras;
+ }
+ 
+ status_t CameraService::getCameraInfo(int cameraId,
+@@ -230,7 +296,7 @@ status_t CameraService::getCameraInfo(int cameraId,
+         return -ENODEV;
+     }
+ 
+-    if (cameraId < 0 || cameraId >= 1) {
++    if (cameraId < 0 || cameraId >= mNumberOfCameras) {
+         return BAD_VALUE;
+     }
+ 
+diff --git a/services/camera/libcameraservice/CameraService.h b/services/camera/libcameraservice/CameraService.h
+index 119e1e8..6222bc1 100644
+--- a/services/camera/libcameraservice/CameraService.h
++++ b/services/camera/libcameraservice/CameraService.h
+@@ -464,6 +464,11 @@ private:
+             int callingPid,
+             int halVersion = CAMERA_HAL_API_VERSION_UNSPECIFIED,
+             bool legacyMode = false);
++
++    // MStar Android Patch Begin
++    static void *waitForNextEvent(void *data);
++    static void updateCameraDevice(const char *buffer, size_t length);
++    // MStar Android Patch End
+ };
+ 
+ } // namespace android
+-- 
+1.7.9.5
+
